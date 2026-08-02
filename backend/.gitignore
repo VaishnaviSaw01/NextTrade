@@ -1,0 +1,87 @@
+# Environment variables - DO NOT COMMIT TO VERSION CONTROL
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Database files
+# Database
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite
+data/insight_stock.db
+
+# Runtime state files (change during execution)
+data/scheduler_state.json
+data/scheduler_history.json
+data/quota_tracking.json
+
+# Data files — only commit example configs
+data/*.json
+data/*.db
+data/*.csv
+data/*.pkl
+!data/collector_config.example.json
+
+# Secure keys - NEVER commit (encrypted API keys)
+data/secure_keys/
+
+# Training data and models
+data/training/
+data/models/
+data/backups/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and temporary files
+*.log
+logs/
+temp/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
