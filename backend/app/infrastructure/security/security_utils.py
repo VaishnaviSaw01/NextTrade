@@ -12,6 +12,7 @@ Implements the APIKeyManager component from the FYP Implementation Plan.
 """
 
 import hashlib
+import hmac
 import secrets
 import base64
 import re
@@ -79,7 +80,13 @@ class SecurityUtils:
         Returns:
             True if password matches, False otherwise
         """
-        return SecurityUtils.hash_password(password, salt) == hashed_password
+        # Constant-time compare — a plain `==` short-circuits on the first
+        # differing byte, which leaks timing information an attacker can
+        # use to guess the hash one byte at a time.
+        return hmac.compare_digest(
+            SecurityUtils.hash_password(password, salt),
+            hashed_password
+        )
     
     def encrypt_api_key(self, api_key: str) -> Optional[str]:
         """
@@ -148,20 +155,21 @@ class SecurityUtils:
     def sanitize_input(input_string: str) -> str:
         """
         Sanitize user input to prevent XSS attacks
-        
+
         Args:
             input_string: Raw user input
-            
+
         Returns:
             Sanitized input string
         """
         if not input_string:
             return ""
-        
-        # HTML escape
-        sanitized = html.escape(input_string)
-        
-        # Remove potentially dangerous patterns
+
+        # Strip dangerous patterns BEFORE escaping. Escaping first turns
+        # every literal `<` into `&lt;`, so a `<script.*?</script>` (or
+        # any other pattern looking for a raw angle bracket) can never
+        # match afterwards — that ordering previously made this whole
+        # step a no-op that only looked like extra protection.
         dangerous_patterns = [
             r'<script.*?</script>',
             r'javascript:',
@@ -169,10 +177,14 @@ class SecurityUtils:
             r'onerror=',
             r'onclick=',
         ]
-        
+
+        sanitized = input_string
         for pattern in dangerous_patterns:
             sanitized = re.sub(pattern, '', sanitized, flags=re.IGNORECASE)
-        
+
+        # HTML escape what's left
+        sanitized = html.escape(sanitized)
+
         return sanitized.strip()
     
     @staticmethod
@@ -243,14 +255,21 @@ class SecurityUtils:
         """
         if not url:
             return False
-        
+
         # Check for absolute URLs
         if url.startswith('http://') or url.startswith('https://'):
             from urllib.parse import urlparse
             parsed = urlparse(url)
             return parsed.hostname in allowed_hosts
-        
-        # Relative URLs are generally safe
+
+        # Protocol-relative URLs (`//evil.com/path`) start with `/` but
+        # browsers resolve them as absolute — to whatever host follows
+        # the slashes. Reject those before the relative-URL check below,
+        # which would otherwise wave them through as "safe".
+        if url.startswith('//') or url.startswith('/\\'):
+            return False
+
+        # Genuinely relative URLs are safe
         return url.startswith('/')
     
     @staticmethod

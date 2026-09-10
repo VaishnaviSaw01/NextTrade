@@ -9,6 +9,11 @@ alembic==1.13.3
 psycopg2-binary==2.9.9
 asyncpg==0.29.0
 aiosqlite==0.20.0
+# SQLAlchemy's asyncio engine needs greenlet unconditionally; SQLAlchemy
+# only auto-installs it as a transitive dep for python_version < 3.13, so
+# pin it directly or `alembic upgrade head` / app startup breaks with
+# "MissingGreenlet" on newer interpreters.
+greenlet>=3.0.0
 
 # Data Validation and Serialization
 pydantic==2.8.2
@@ -35,6 +40,7 @@ passlib[bcrypt]==1.7.4
 python-dotenv==1.0.1
 PyJWT==2.9.0
 cryptography==43.0.3
+pyotp==2.9.0
 
 # Task Queue & Background Jobs
 apscheduler==3.10.4

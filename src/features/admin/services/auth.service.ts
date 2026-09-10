@@ -6,7 +6,6 @@ export interface AdminUser {
   name: string;
   picture?: string;
   totpEnabled: boolean;
-  totpSecret?: string;
 }
 
 export interface AuthSession {
@@ -28,7 +27,6 @@ const rateLimitStore = new Map<string, RateLimitEntry>();
 
 // Session storage (in production, use secure server-side storage)
 const SESSION_KEY = 'admin_auth_session';
-const TOTP_SECRETS_KEY = 'admin_totp_secrets';
 
 export class AuthService {
   private static instance: AuthService;
@@ -82,7 +80,10 @@ export class AuthService {
         email: authResult.user.email,
         name: authResult.user.name || authResult.user.email,
         picture: authResult.user.picture,
-        totpEnabled: this.hasTotpSecret(authResult.user.email),
+        // Whether this admin already has a TOTP secret is now decided
+        // server-side (it's the server that stores secrets), not by
+        // checking this browser's localStorage.
+        totpEnabled: Boolean(authResult.totp_enabled),
       };
 
       this.createSession(adminUser, authResult.access_token, authResult.refresh_token);
@@ -97,191 +98,89 @@ export class AuthService {
     }
   }
 
-  // Legacy exchangeCodeForTokens removed — OAuth token exchange MUST happen
-  // server-side only (via /api/admin/auth/oauth/google) to protect client_secret.
+  // Legacy exchangeCodeForTokens and getUserInfo removed — OAuth token
+  // exchange AND the userinfo fetch both MUST happen server-side only
+  // (via /api/admin/auth/oauth/google) to protect client_secret; this
+  // class never talks to Google directly.
 
-  private async getUserInfo(accessToken: string): Promise<any> {
-    const response = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error('Failed to fetch user info');
+  // TOTP Management — setup and verification both happen server-side now.
+  // The secret is generated and stored by the backend (TOTPService); this
+  // client only ever sees it long enough to render the QR code / manual
+  // entry key during enrollment.
+  async setupTotp(email: string): Promise<{ secret: string; qrCode: string } | null> {
+    if (!this.session) {
+      return null;
     }
 
-    return response.json();
-  }
+    try {
+      const response = await fetch(`${this.getApiBaseUrl()}/api/admin/auth/totp/setup`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${this.session.accessToken}`,
+        },
+      });
 
-  // TOTP Management
-  generateTotpSecret(email: string): { secret: string; qrCode: string } {
-    // Generate a cryptographically secure random secret
-    const secret = this.generateRandomSecret(32);
-    
-    // Store the secret (encrypted via Web Crypto AES-GCM)
-    this.storeTotpSecret(email, secret);
-    
-    // Generate QR code URL for authenticator apps
-    const otpauth = `otpauth://totp/${encodeURIComponent(securityConfig.totp.issuer)}:${encodeURIComponent(email)}?secret=${secret}&issuer=${encodeURIComponent(securityConfig.totp.issuer)}&algorithm=${securityConfig.totp.algorithm}&digits=${securityConfig.totp.digits}&period=${securityConfig.totp.period}`;
-    
-    return { secret, qrCode: otpauth };
+      if (!response.ok) {
+        this.logSecurityEvent('TOTP_SETUP_FAILED', { email });
+        return null;
+      }
+
+      const result = await response.json();
+      return { secret: result.secret, qrCode: result.qrcode_url };
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.error('TOTP setup error:', error);
+      }
+      this.logSecurityEvent('TOTP_SETUP_ERROR', { email });
+      return null;
+    }
   }
 
   async verifyTotp(email: string, token: string): Promise<boolean> {
-    try {
-      // TOTP verification MUST happen server-side.
-      // Client-side fallback has been removed to prevent bypass.
-      if (this.session && this.session.user.email === email) {
-        try {
-          const response = await fetch(`${this.getApiBaseUrl()}/api/admin/auth/totp/verify`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${this.session.accessToken}`,
-            },
-            body: JSON.stringify({ 
-              email,
-              totp_code: token 
-            }),
-          });
-
-          if (response.ok) {
-            const result = await response.json();
-            if (result.verified) {
-              // Mark TOTP as verified in session
-              this.session.totpVerified = true;
-              this.saveSession();
-              this.logSecurityEvent('TOTP_VERIFIED', { email });
-              return true;
-            }
-          }
-
-          this.logSecurityEvent('TOTP_FAILED', { email });
-          return false;
-        } catch (error) {
-          if (import.meta.env.DEV) {
-            console.error('Backend TOTP verification failed:', error);
-          }
-          // Do NOT fall back to client-side verification
-          this.logSecurityEvent('TOTP_BACKEND_UNREACHABLE', { email });
-          return false;
-        }
-      }
-
-      // Also try backend verification for users without active session
-      // (e.g., during initial setup)
-      const secret = this.getTotpSecret(email);
-      if (secret) {
-        const valid = await this.verifyTotpToken(secret, token);
-        if (valid && this.session && this.session.user.email === email) {
-          this.session.totpVerified = true;
-          this.saveSession();
-          this.logSecurityEvent('TOTP_VERIFIED', { email });
-        }
-        return valid;
-      }
-
-      return false;
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.error('TOTP verification error:', error);
-      }
-      this.logSecurityEvent('TOTP_ERROR', { email, error: error });
+    if (!this.session || this.session.user.email !== email) {
       return false;
     }
-  }
 
-  private async verifyTotpToken(secret: string, token: string): Promise<boolean> {
     try {
-      // Use Web Crypto API for proper TOTP verification
-      const timeStep = 30; // 30 seconds
-      const window = 2; // Allow 2 time windows for clock skew
-      const currentTime = Math.floor(Date.now() / 1000);
-      
-      // Check current time window and adjacent windows
-      for (let i = -window; i <= window; i++) {
-        const timeWindow = Math.floor((currentTime + (i * timeStep)) / timeStep);
-        const expectedToken = await this.generateTOTP(secret, timeWindow);
-        if (token === expectedToken) {
+      const response = await fetch(`${this.getApiBaseUrl()}/api/admin/auth/totp/verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.session.accessToken}`,
+        },
+        body: JSON.stringify({
+          email,
+          totp_code: token
+        }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        if (result.verified && result.access_token) {
+          // The pre-auth token used to get this far carries no admin
+          // permissions — swap it for the fully-verified token the
+          // backend just minted. Every subsequent admin API call needs
+          // to use THIS token from here on.
+          this.session.accessToken = result.access_token;
+          this.session.refreshToken = result.refresh_token;
+          this.session.totpVerified = true;
+          this.session.user.totpEnabled = true;
+          sessionStorage.setItem('admin_token', result.access_token);
+          this.saveSession();
+          this.logSecurityEvent('TOTP_VERIFIED', { email });
           return true;
         }
       }
-      
+
+      this.logSecurityEvent('TOTP_FAILED', { email });
       return false;
     } catch (error) {
       if (import.meta.env.DEV) {
-        console.error('TOTP verification error:', error);
+        console.error('Backend TOTP verification failed:', error);
       }
+      this.logSecurityEvent('TOTP_BACKEND_UNREACHABLE', { email });
       return false;
     }
-  }
-
-  private async generateTOTP(secret: string, timeWindow: number): Promise<string> {
-    try {
-      // Convert secret from base32 to bytes
-      const key = this.base32ToBytes(secret);
-      
-      // Convert time window to 8-byte array (big endian)
-      const timeBytes = new ArrayBuffer(8);
-      const timeView = new DataView(timeBytes);
-      timeView.setUint32(4, timeWindow, false); // Big endian, high 32 bits are 0
-      
-      // Import key for HMAC-SHA1
-      const keyBuffer = new Uint8Array(key).buffer;
-      const cryptoKey = await crypto.subtle.importKey(
-        'raw',
-        keyBuffer,
-        { name: 'HMAC', hash: 'SHA-1' },
-        false,
-        ['sign']
-      );
-      
-      // Generate HMAC-SHA1
-      const signature = await crypto.subtle.sign('HMAC', cryptoKey, timeBytes);
-      const hmac = new Uint8Array(signature);
-      
-      // Dynamic truncation
-      const offset = hmac[hmac.length - 1] & 0x0f;
-      const code = ((hmac[offset] & 0x7f) << 24) |
-                   ((hmac[offset + 1] & 0xff) << 16) |
-                   ((hmac[offset + 2] & 0xff) << 8) |
-                   (hmac[offset + 3] & 0xff);
-      
-      // Return 6-digit code
-      return (code % 1000000).toString().padStart(6, '0');
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.error('TOTP generation error:', error);
-      }
-      return '000000'; // Fallback
-    }
-  }
-
-  private base32ToBytes(base32: string): Uint8Array {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    let bits = '';
-    
-    // Remove padding and convert to uppercase
-    const cleanBase32 = base32.toUpperCase().replace(/=/g, '');
-    
-    for (const char of cleanBase32) {
-      const index = alphabet.indexOf(char);
-      if (index === -1) continue;
-      bits += index.toString(2).padStart(5, '0');
-    }
-    
-    // Convert bits to bytes
-    const bytes = new Uint8Array(Math.floor(bits.length / 8));
-    for (let i = 0; i < bytes.length; i++) {
-      const bitStart = i * 8;
-      const bitEnd = bitStart + 8;
-      if (bitEnd <= bits.length) {
-        bytes[i] = parseInt(bits.substring(bitStart, bitEnd), 2);
-      }
-    }
-    
-    return bytes;
   }
 
   // Session Management
@@ -422,55 +321,23 @@ export class AuthService {
     sessionStorage.removeItem(SESSION_KEY);
   }
 
-  private storeTotpSecret(email: string, secret: string): void {
-    try {
-      const secrets = this.getTotpSecrets();
-      secrets[email] = this.encrypt(secret);
-      localStorage.setItem(TOTP_SECRETS_KEY, JSON.stringify(secrets));
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.error('Failed to store TOTP secret:', error);
-      }
-    }
-  }
-
-  private getTotpSecret(email: string): string | null {
-    try {
-      const secrets = this.getTotpSecrets();
-      const encrypted = secrets[email];
-      return encrypted ? this.decrypt(encrypted) : null;
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.error('Failed to retrieve TOTP secret:', error);
-      }
-      return null;
-    }
-  }
-
-  private hasTotpSecret(email: string): boolean {
-    return this.getTotpSecret(email) !== null;
-  }
-
-  private getTotpSecrets(): Record<string, string> {
-    try {
-      const stored = localStorage.getItem(TOTP_SECRETS_KEY);
-      return stored ? JSON.parse(stored) : {};
-    } catch {
-      return {};
-    }
-  }
-
-  // Encryption helpers using Web Crypto API (AES-GCM)
+  // Storage obfuscation helpers for sessionStorage.
+  //
+  // This is NOT encryption — it's a base64 transform with a random,
+  // unused IV prepended, despite what an earlier version of this
+  // comment claimed. It never called the Web Crypto API. Real crypto
+  // here would need `saveSession`/`loadSession` to go async (this class
+  // calls `loadSession()` synchronously from its constructor), for
+  // protection that wouldn't meaningfully help anyway: anything that can
+  // run JS in this origin can call `authService.getSession()` directly,
+  // encrypted-at-rest or not. The actual fix for the secret this used to
+  // guard — the TOTP secret — is that it no longer touches the browser
+  // at all; see setupTotp()/verifyTotp() above.
   private encrypt(data: string): string {
-    // Use AES-GCM encryption with a derived key from a fixed application salt.
-    // This is a defense-in-depth measure; the primary protection is
-    // that TOTP secrets should ideally live server-side.
     try {
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const encoder = new TextEncoder();
       const encoded = encoder.encode(data);
-      // For synchronous localStorage storage, use a reversible transform
-      // with a random IV prepended (base64 of IV + encrypted data)
       const ivHex = Array.from(iv, b => b.toString(16).padStart(2, '0')).join('');
       const dataB64 = btoa(String.fromCharCode(...encoded));
       return ivHex + ':' + dataB64;
@@ -497,13 +364,6 @@ export class AuthService {
     }
   }
 
-  private generateRandomSecret(length: number): string {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    const array = new Uint8Array(length);
-    crypto.getRandomValues(array);
-    return Array.from(array, b => chars[b % chars.length]).join('');
-  }
-
   // Activity monitoring
   private startActivityMonitoring(): void {
     // Check session expiry every minute
@@ -522,7 +382,7 @@ export class AuthService {
   }
 
   // Security logging
-  private logSecurityEvent(event: string, details: any): void {
+  private logSecurityEvent(event: string, details: Record<string, unknown>): void {
     const logEntry = {
       timestamp: new Date().toISOString(),
       event,
