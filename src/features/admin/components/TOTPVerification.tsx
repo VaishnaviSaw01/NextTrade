@@ -24,11 +24,27 @@ const TOTPVerification = ({ email, isNewSetup, onSuccess, onCancel }: TOTPVerifi
   const [step, setStep] = useState<'setup' | 'verify'>(isNewSetup ? 'setup' : 'verify');
 
   useEffect(() => {
-    if (isNewSetup) {
-      // Generate new TOTP secret for first-time setup
-      const data = authService.generateTotpSecret(email);
-      setSetupData(data);
+    if (!isNewSetup) {
+      return;
     }
+
+    let cancelled = false;
+
+    // Fetch (or create) the TOTP secret from the backend for first-time
+    // setup — this now round-trips to the server rather than generating
+    // a secret in the browser that the server never sees.
+    authService.setupTotp(email).then((data) => {
+      if (cancelled) return;
+      if (data) {
+        setSetupData(data);
+      } else {
+        setError('Could not start TOTP setup. Please try again.');
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [email, isNewSetup]);
 
   const handleVerify = async () => {

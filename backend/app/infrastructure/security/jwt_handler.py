@@ -28,10 +28,11 @@ class JWTHandler:
     
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.algorithm = "HS256"
-        self.access_token_expire_minutes = 30
-        self.refresh_token_expire_days = 7
-        
+        self.algorithm = getattr(settings, "jwt_algorithm", "HS256")
+        self.access_token_expire_minutes = getattr(settings, "jwt_access_token_expire_minutes", 30)
+        self.refresh_token_expire_days = getattr(settings, "jwt_refresh_token_expire_days", 7)
+        self.pre_auth_token_expire_minutes = 10
+
     def create_access_token(self, data: Dict[str, Any]) -> str:
         """
         Create JWT access token for admin sessions
@@ -53,6 +54,33 @@ class JWTHandler:
         )
         return encoded_jwt
     
+    def create_pre_auth_token(self, data: Dict[str, Any]) -> str:
+        """
+        Create a short-lived, permission-less token for the gap between a
+        successful Google OAuth exchange and a successful TOTP check.
+
+        This token deliberately carries no "admin" permission and no
+        "totp_verified" claim, so `AuthService.validate_admin_token` will
+        always reject it — it is only accepted by the TOTP setup/verify
+        endpoints, which use it solely to know *who* is completing
+        second-factor login.
+
+        Args:
+            data: Token payload data (must include "sub"/"email")
+
+        Returns:
+            Encoded JWT token string
+        """
+        to_encode = data.copy()
+        expire = utc_now() + timedelta(minutes=self.pre_auth_token_expire_minutes)
+        to_encode.update({"exp": expire, "type": "pre_auth"})
+
+        return jwt.encode(
+            to_encode,
+            self.settings.jwt_secret_key,
+            algorithm=self.algorithm
+        )
+
     def create_refresh_token(self, data: Dict[str, Any]) -> str:
         """
         Create JWT refresh token for session renewal
@@ -93,7 +121,12 @@ class JWTHandler:
             return payload
         except jwt.ExpiredSignatureError:
             return None
-        except jwt.JWTError:
+        except jwt.InvalidTokenError:
+            # Covers PyJWT's whole invalid-token family (bad signature,
+            # malformed token, wrong algorithm, etc.). PyJWT has no
+            # `JWTError` — that's python-jose's name — so catching it
+            # here previously raised AttributeError instead of failing
+            # closed.
             return None
     
     def is_token_expired(self, token: str) -> bool:
@@ -117,7 +150,7 @@ class JWTHandler:
             if exp:
                 return utc_now() > datetime.fromtimestamp(exp)
             return True
-        except jwt.JWTError:
+        except jwt.InvalidTokenError:
             return True
     
     def get_token_subject(self, token: str) -> Optional[str]:

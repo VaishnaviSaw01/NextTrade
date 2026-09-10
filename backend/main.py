@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+import sys
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -76,6 +77,25 @@ structlog.configure(
 logger = structlog.get_logger()
 
 
+def _safe_print(text: str) -> None:
+    """
+    print() that can't take the whole app down over a glyph.
+
+    On Windows, stdout falls back to the legacy system codepage (often
+    cp1252) whenever it isn't attached to a live UTF-8 console — piped to
+    a file, run under a process manager, containerized without
+    PYTHONUTF8=1. print()-ing the box-drawing startup banner or the
+    unicode status icons below then raised UnicodeEncodeError *inside
+    the FastAPI lifespan*, which aborted startup entirely. Degrade to a
+    best-effort ASCII rendering instead of crashing.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding))
+
+
 def print_startup_banner():
     """Print professional startup banner with system information."""
     settings = get_settings()
@@ -99,7 +119,7 @@ def print_startup_banner():
 ║  Features:    Sentiment Analysis | Real-time Prices | Smart Scheduler     ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 """
-    print(banner)
+    _safe_print(banner)
 
 
 async def perform_health_check() -> Dict[str, Any]:
@@ -225,25 +245,25 @@ async def perform_health_check() -> Dict[str, Any]:
 def print_health_check_summary(health: Dict[str, Any]):
     """Print health check summary in a readable format."""
     status_icon = "✓" if health["overall_status"] == "healthy" else "⚠" if health["overall_status"] == "degraded" else "✗"
-    
-    print(f"\n{'='*80}")
-    print(f"  STARTUP HEALTH CHECK - {status_icon} {health['overall_status'].upper()}")
-    print(f"{'='*80}")
-    
+
+    _safe_print(f"\n{'='*80}")
+    _safe_print(f"  STARTUP HEALTH CHECK - {status_icon} {health['overall_status'].upper()}")
+    _safe_print(f"{'='*80}")
+
     for service_name, service_info in health["services"].items():
         status = service_info.get("status", "Unknown")
-        print(f"  {service_name.replace('_', ' ').title():<25} {status}")
-        
+        _safe_print(f"  {service_name.replace('_', ' ').title():<25} {status}")
+
         # Print additional info
         for key, value in service_info.items():
             if key != "status" and key != "error":
-                print(f"    ├─ {key}: {value}")
-        
+                _safe_print(f"    ├─ {key}: {value}")
+
         # Print errors if any
         if "error" in service_info:
-            print(f"    └─ Error: {service_info['error']}")
-    
-    print(f"{'='*80}\n")
+            _safe_print(f"    └─ Error: {service_info['error']}")
+
+    _safe_print(f"{'='*80}\n")
 
 
 @asynccontextmanager

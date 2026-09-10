@@ -51,22 +51,22 @@ class AuthService:
         self.settings = settings
         self.jwt_handler = JWTHandler(settings)
         self.security_utils = SecurityUtils()
-        
-        # Admin users - validates against configured admin accounts
-        self.admin_users = {
-            "admin@example.com": AdminUser("admin_1", "admin@example.com")
-        }
-    
+
     async def validate_admin_token(self, token: str) -> Optional[AdminUser]:
         """
         Validate JWT token from frontend authentication
-        
+
         This method validates tokens created by the existing frontend
         OAuth2 + TOTP authentication system.
-        
+
+        Requires a full "access" token that was minted only after TOTP
+        verification succeeded — a pre-auth token (issued right after
+        Google OAuth, before TOTP) always fails this check, even though
+        it's signed with the same secret and carries the right email.
+
         Args:
             token: JWT token from frontend
-            
+
         Returns:
             AdminUser if token is valid, None otherwise
         """
@@ -74,27 +74,34 @@ class AuthService:
             # Remove 'Bearer ' prefix if present
             if token.startswith('Bearer '):
                 token = token[7:]
-            
+
             # Verify token signature and expiration
             payload = self.jwt_handler.verify_token(token)
             if not payload:
                 logger.warning("Invalid JWT token provided")
                 return None
-            
+
+            if payload.get("type") != "access":
+                logger.warning(f"Rejected non-access token of type '{payload.get('type')}' for admin route")
+                return None
+
             # Extract user information from token
             user_email = payload.get("sub") or payload.get("email")
             user_id = payload.get("user_id") or payload.get("sub")
-            
+
             if not user_email or not user_id:
                 logger.warning("Missing user information in token")
                 return None
-            
-            # Validate admin permissions
+
+            # Validate admin permissions AND that TOTP was actually
+            # completed for this session — permissions alone are not
+            # enough, since a pre-auth token could otherwise be forged
+            # into carrying them.
             permissions = payload.get("permissions", [])
-            if "admin" not in permissions:
-                logger.warning(f"User {user_email} does not have admin permissions")
+            if "admin" not in permissions or not payload.get("totp_verified"):
+                logger.warning(f"User {user_email} does not have a fully-verified admin session")
                 return None
-            
+
             # Create or update admin user
             admin_user = AdminUser(user_id, user_email)
             admin_user.last_login = utc_now()
@@ -153,16 +160,20 @@ class AuthService:
             
             user_email = payload.get("sub") or payload.get("email")
             user_id = payload.get("user_id") or payload.get("sub")
-            
+
             if not user_email or not user_id:
                 return None
-            
-            # Create new tokens
+
+            # Create new tokens — carries forward the same fully-verified
+            # state as the token being refreshed (refresh tokens are only
+            # ever issued alongside a totp_verified access token, so this
+            # is safe: see create_admin_session)
             token_data = {
                 "sub": user_email,
                 "user_id": user_id,
                 "email": user_email,
-                "permissions": ["admin"]
+                "permissions": ["admin"],
+                "totp_verified": True
             }
             
             new_access_token = self.jwt_handler.create_access_token(token_data)
@@ -180,12 +191,16 @@ class AuthService:
     
     async def create_admin_session(self, user_email: str, additional_data: Dict[str, Any] = None) -> Dict[str, str]:
         """
-        Create new admin session (for internal use)
-        
+        Create a fully-verified admin session.
+
+        Only call this AFTER TOTP verification has actually succeeded —
+        it's the one place that stamps a token as `totp_verified`, which
+        is what `validate_admin_token` requires for every protected route.
+
         Args:
             user_email: Admin email
             additional_data: Additional token data
-            
+
         Returns:
             Dictionary with access and refresh tokens
         """
@@ -195,10 +210,14 @@ class AuthService:
             "permissions": ["admin"],
             "user_id": f"admin_{hash(user_email) % 10000}"
         }
-        
+
         if additional_data:
             token_data.update(additional_data)
-        
+
+        # totp_verified is set last and unconditionally — additional_data
+        # is caller-supplied and must never be able to unset it.
+        token_data["totp_verified"] = True
+
         access_token = self.jwt_handler.create_access_token(token_data)
         refresh_token = self.jwt_handler.create_refresh_token(token_data)
         

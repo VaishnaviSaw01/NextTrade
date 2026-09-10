@@ -2508,7 +2508,12 @@ class DataPipeline:
                                             entity_score = 0.0
                                         
                                         # Find stock ID for this entity (may be different from original metadata)
-                                        from sqlalchemy import select
+                                        # NOTE: `select` is NOT re-imported here on purpose — it's already
+                                        # imported at module level (line 22). A local `from sqlalchemy import
+                                        # select` here previously shadowed it for this whole method, making
+                                        # every earlier `select(...)` call in process_recent_data() (e.g. the
+                                        # dynamic-watchlist lookup) raise UnboundLocalError before this line
+                                        # was ever reached.
                                         from app.data_access.models import Stock
                                         stock_query = select(Stock.id).where(Stock.symbol == entity_symbol)
                                         stock_result = await db.execute(stock_query)

@@ -9,9 +9,11 @@ Handles environment variables, validation, and configuration loading.
 from typing import List, Optional, Union
 from pydantic import Field
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from functools import lru_cache
 import secrets
+
+_PLACEHOLDER_PREFIX = "CHANGE_ME"
 
 
 class Settings(BaseSettings):
@@ -38,9 +40,15 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, description="Enable debug mode")
     environment: str = Field(default="production", description="Environment: development, staging, production")
     
-    # Security
-    secret_key: str = secrets.token_urlsafe(32)
-    jwt_secret_key: str = secrets.token_urlsafe(32)
+    # Security — left blank by default; resolved in _resolve_and_validate_secrets
+    # below rather than defaulted to secrets.token_urlsafe(32) here. That old
+    # default was computed once at class-definition time, so every Settings()
+    # instance in the process shared it — harmless for a single process, but
+    # it meant a forgotten env var never surfaced as an error: each uvicorn
+    # *worker* process re-imports this module and gets its own random secret,
+    # so admin JWTs signed by one worker silently fail to validate on another.
+    secret_key: str = ""
+    jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
@@ -76,6 +84,40 @@ class Settings(BaseSettings):
                 "Generate one: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
             )
         return v
+
+    @model_validator(mode='after')
+    def _resolve_and_validate_secrets(self):
+        """
+        Fail fast on a missing SECRET_KEY / JWT_SECRET_KEY in production,
+        instead of the previous silent, per-process random default. In
+        development/testing, keep generating one automatically so local
+        runs and the test suite don't need it configured.
+        """
+        def is_unset(value: str) -> bool:
+            return not value or value.startswith(_PLACEHOLDER_PREFIX)
+
+        if self.environment == "production":
+            missing = [
+                name for name, value in (
+                    ("SECRET_KEY", self.secret_key),
+                    ("JWT_SECRET_KEY", self.jwt_secret_key),
+                )
+                if is_unset(value)
+            ]
+            if missing:
+                raise ValueError(
+                    f"{' and '.join(missing)} must be set to a unique, random value when "
+                    "ENVIRONMENT=production - refusing to start with an auto-generated or "
+                    "placeholder secret. Generate one with: "
+                    "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+                )
+        else:
+            if is_unset(self.secret_key):
+                self.secret_key = secrets.token_urlsafe(32)
+            if is_unset(self.jwt_secret_key):
+                self.jwt_secret_key = secrets.token_urlsafe(32)
+
+        return self
 
     # Rate Limiting
     rate_limit_requests: int = 100
